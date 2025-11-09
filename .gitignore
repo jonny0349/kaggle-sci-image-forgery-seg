@@ -1,25 +1,25 @@
-#Python
+# Python
 __pycache__/
-*.py
+*.pyc
 *.pyo
 *.pyd
 *.egg-info/
 
-#Virtual envs
+# Virtual envs
 .venv/
 .env
 .envrc
 
-#Jupyter
+# Jupyter
 .ipynb_checkpoints/
 
-#VSCode / IDE
+# VSCode / IDE
 .vscode/
 .idea/
 
-#Data & outputs (kept local; don't push big files)
+# Data & outputs (kept local; don’t push big files)
 data/
 outputs/
 
-#OS cruft
+# OS cruft
 .DS_Store
