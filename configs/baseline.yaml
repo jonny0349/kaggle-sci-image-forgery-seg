@@ -50,7 +50,7 @@ scheduler:
 train:
   epochs: 20
   batch_size: 4
-  num_workers: 4
+  num_workers: 0
   grad_accum_steps: 1
   mixed_precision: true
 

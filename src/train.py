@@ -73,7 +73,8 @@ def train_one_epoch(model, loader, loss_fn, optimizer, scaler, device, amp):
             with autocast():
                 logits = model(imgs)
                 loss = loss_fn(logits, masks)
-            scaler.scale(loss).masked_fill_(torch.isnan(loss), 0.0)
+            if torch.isnan(loss):
+                continue
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()

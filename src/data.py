@@ -33,7 +33,7 @@ from torch.utils.data import Dataset, DataLoader
 
 def _build_train_transforms(cfg) -> A.BasicTransform:
     """Create the training augmentation pipeline."""
-    h, w = cfg.augment.train["resize"]
+    h, w = cfg.augment.train.resize
     return A.Compose([
         A.Resize(h, w, interpolation=cv2.INTER_LINEAR),
         A.HorizontalFlip(p=cfg.augment.train.get("hflip_p", 0.5)),
@@ -55,7 +55,7 @@ def _build_train_transforms(cfg) -> A.BasicTransform:
 
 def _build_val_transforms(cfg) -> A.BasicTransform:
     """Validation pipeline: deterministic resize + normalization."""
-    h, w = cfg.augment.val["resize"]
+    h, w = cfg.augment.val.resize
     return A.Compose([
         A.Resize(h, w, interpolation=cv2.INTER_LINEAR),
         A.Normalize(mean=(0.485, 0.456, 0.406),

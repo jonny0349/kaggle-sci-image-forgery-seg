@@ -16,7 +16,7 @@ import torch
 import segmentation_models_pytorch as smp
 
 
-def _build_model(cfg: Any) -> torch.nn.Module:
+def build_model(cfg: Any) -> torch.nn.Module:
     """
     Build a segmentation model based on the YAML config.
 

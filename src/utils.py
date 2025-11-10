@@ -49,14 +49,44 @@ class DotDict:
         cfg.train.epochs
     instead of:
         cfg['train']['epochs']
+    Dot-access wrapper around a nested dict that still behaves like a dict:
+      - cfg.section.key    (dot)
+      - cfg['section']['key'] (index)
+      - cfg.section.get('key', default)
+      - 'key' in cfg.section
+      - cfg.section.items(), keys(), values()
     """
     _data: Dict[str, Any]
 
+    # --- attribute access ---
     def __getattr__(self, item: str) -> Any:
+        if item == "_data":
+            return super().__getattribute__("_data")
         val = self._data[item]
-        if isinstance(val, dict):
-            return DotDict(val)
-        return val
+        return DotDict(val) if isinstance(val, dict) else val
+
+    # --- mapping helpers ---
+    def __getitem__(self, key: str) -> Any:
+        val = self._data[key]
+        return DotDict(val) if isinstance(val, dict) else val
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._data
+
+    def get(self, key: str, default: Any = None) -> Any:
+        val = self._data.get(key, default)
+        return DotDict(val) if isinstance(val, dict) else val
+
+    def items(self) -> Iterable:
+        for k, v in self._data.items():
+            yield k, DotDict(v) if isinstance(v, dict) else v
+
+    def keys(self) -> Iterable:
+        return self._data.keys()
+
+    def values(self) -> Iterable:
+        for v in self._data.values():
+            yield DotDict(v) if isinstance(v, dict) else v
 
     def to_dict(self) -> Dict[str, Any]:
         return _deep_to_plain(self._data)
