@@ -2,7 +2,7 @@
 
 project:
   seed: 2025
-  device: "CPU" #Change to "cuda" on Kaggle
+  device: "auto" #will pick cuda>mps>cpu automatically
   output_dir: "outputs" #Logs, checkpoints, predictions
 
 data:
@@ -12,8 +12,10 @@ data:
   val_images_dir: "val/images"
   val_masks_dir: "val/masks"
   img_ext: ".png"
-  "mask_ext": ".png"
+  mask_ext: ".npy"
+  mask_suffix: "" # e.g.,"_mask" if files are like 10_mask.npy
   num_classes: 1 # Binary segmentation: forged vs background
+  background_is_zero: True
 
 augment:
   train:
@@ -28,7 +30,7 @@ augment:
 
 model:
   arch: "UNet" # From segementation_models_pytorch
-  encoder: "rasnet34"
+  encoder: "resnet34"
   encoder_weights: "imagenet"
   in_channels: 3
   classes: 1
@@ -48,7 +50,7 @@ scheduler:
   min_lr: 1.0e-6
 
 train:
-  epochs: 20
+  epochs: 1
   batch_size: 4
   num_workers: 0
   grad_accum_steps: 1

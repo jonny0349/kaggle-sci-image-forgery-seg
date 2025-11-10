@@ -23,7 +23,8 @@ from typing import Dict
 
 import torch
 from torch import optim
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import autocast
+from torch.amp import GradScaler
 from torch.utils.tensorboard import SummaryWriter
 
 from src.utils import load_config, set_seed, build_output_tree, get_logger, ensure_dir, save_json
@@ -59,13 +60,13 @@ def create_scheduler(optimizer, cfg):
         return None, cosine
 
 
-def train_one_epoch(model, loader, loss_fn, optimizer, scaler, device, amp):
+def train_one_epoch(model, loader, loss_fn, optimizer, scaler, torch_device, amp):
     model.train()
     running_loss = 0.0
 
     for imgs, masks, _ in loader:
-        imgs = imgs.to(device, non_blocking=True)
-        masks = masks.to(device, non_blocking=True)
+        imgs = imgs.to(torch_device, non_blocking=True)
+        masks = masks.to(torch_device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -92,12 +93,12 @@ def train_one_epoch(model, loader, loss_fn, optimizer, scaler, device, amp):
 
 
 @torch.no_grad()
-def validate_one_epoch(model, loader, device, thr=0.5):
+def validate_one_epoch(model, loader, torch_device, thr=0.5):
     model.eval()
     dices, ious = [], []
     for imgs, masks, _ in loader:
-        imgs = imgs.to(device, non_blocking=True)
-        masks = masks.to(device, non_blocking=True)
+        imgs = imgs.to(torch_device, non_blocking=True)
+        masks = masks.to(torch_device, non_blocking=True)
         logits = model(imgs)
         probs = torch.sigmoid(logits)
         dices.append(dice_coef(probs, masks, thr=thr).item())
@@ -124,18 +125,40 @@ def main():
     # Save a snapshot of config for traceability
     save_json(cfg.to_dict(), os.path.join(out_dir, "config_snapshot.json"))
 
-    # Data
-    loaders = make_dataloaders(cfg)
+    # Device (robust handling; supports 'cpu' | 'cuda' | 'mps' | 'auto')
+    requested = str(cfg.project.device).strip().lower()
 
-    # Device
-    device = cfg.project.device
-    if device == "cuda" and not torch.cuda.is_available():
+    def pick_auto_device():
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+
+    if requested in ("auto", "auto_gpu"):
+        device = pick_auto_device()
+    elif requested in ("cpu", "cuda", "mps"):
+        device = requested
+        # downgrade gracefully if user requests an unavailable accelerator
+        if device == "cuda" and not torch.cuda.is_available():
+            device = pick_auto_device()
+        if device == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+            device = pick_auto_device()
+    else:
+        # any weird value -> auto
+        device = pick_auto_device()
+
+    if device != str(cfg.project.device).strip().lower():
         logger.warning(
-            "CUDA requested but not available. Falling back to CPU.")
-        device = "cpu"
+            f"Using device '{device}' (requested '{cfg.project.device}')")
+
+    torch_device = torch.device(device)
+
+    # Data
+    loaders = make_dataloaders(cfg, pin_memory=(device == "cuda"))
 
     # Model & loss
-    model = build_model(cfg).to(device)
+    model = build_model(cfg).to(torch_device)
     loss_fn = make_loss(cfg.loss.name)
 
     # Optimizer
@@ -150,7 +173,7 @@ def main():
 
     # AMP scaler
     amp = bool(cfg.train.mixed_precision) and (device == "cuda")
-    scaler = GradScaler(enabled=amp)
+    scaler = GradScaler(device="cuda", enabled=amp)
 
     # Checkpointing
     best_metric = -1.0
@@ -163,49 +186,48 @@ def main():
     total_epochs = int(cfg.train.epochs)
     global_epoch = 0
 
+    warmup_epochs = int(cfg.scheduler.warmup_epochs)
+
     for epoch in range(total_epochs):
-        # Step warmup or cosine appropriately
-        if warmup is not None and epoch < int(cfg.scheduler.warmup_epochs):
-            warmup.step()
-        else:
-            cosine.step()
-
-        # Train
+        # 1) TRAIN (optimizer.step() happens inside here)
         train_loss = train_one_epoch(
-            model, loaders["train"], loss_fn, optimizer, scaler, device, amp)
+            model, loaders["train"], loss_fn, optimizer, scaler, torch_device, amp
+        )
 
-        # Validate
-        val_dice, val_iou = validate_one_epoch(
-            model, loaders["val"], device, thr=0.5)
+    # 2) VALIDATE
+    val_dice, val_iou = validate_one_epoch(
+        model, loaders["val"], torch_device, thr=0.5)
 
-        # Logs
-        lr_now = optimizer.param_groups[0]["lr"]
-        writer.add_scalar("train/loss", train_loss, epoch)
-        writer.add_scalar("val/dice", val_dice, epoch)
-        writer.add_scalar("val/iou", val_iou, epoch)
-        writer.add_scalar("lr", lr_now, epoch)
+    # 3) LOGGING
+    lr_now = optimizer.param_groups[0]["lr"]
+    writer.add_scalar("train/loss", train_loss, epoch)
+    writer.add_scalar("val/dice", val_dice, epoch)
+    writer.add_scalar("val/iou", val_iou, epoch)
+    writer.add_scalar("lr", lr_now, epoch)
+    logger.info(
+        f"Epoch {epoch+1}/{total_epochs} | loss={train_loss:.4f} | dice={val_dice:.4f} | iou={val_iou:.4f} | lr={lr_now:.6f}"
+    )
 
+    # 4) CHECKPOINT
+    current_metric = val_dice if cfg.checkpoint.metric.lower() == "dice" else val_iou
+    is_better = current_metric > best_metric if cfg.checkpoint.mode == "max" else current_metric < best_metric
+    if is_better:
+        best_metric = current_metric
+        best_path = os.path.join(
+            paths["ckpt"], f"best_{cfg.checkpoint.metric}.pt")
+        torch.save(
+            {"epoch": epoch, "state_dict": model.state_dict(),
+             "optimizer": optimizer.state_dict(), "best_metric": best_metric},
+            best_path,
+        )
         logger.info(
-            f"Epoch {epoch+1}/{total_epochs} | loss={train_loss:.4f} | dice={val_dice:.4f} | iou={val_iou:.4f} | lr={lr_now:.6f}")
+            f"Saved new best checkpoint: {best_path} (best {cfg.checkpoint.metric}={best_metric:.4f})")
 
-        # Checkpointing on chosen metric (default: dice, maximize)
-        current_metric = val_dice if metric_name.lower() == "dice" else val_iou
-        is_better = current_metric > best_metric if metric_mode == "max" else current_metric < best_metric
-
-        if is_better:
-            best_metric = current_metric
-            best_path = os.path.join(paths["ckpt"], f"best_{metric_name}.pt")
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "state_dict": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "best_metric": best_metric,
-                },
-                best_path,
-            )
-            logger.info(
-                f"Saved new best checkpoint: {best_path} (best {metric_name}={best_metric:.4f})")
+    # 5) SCHEDULER — step AFTER optimizer has stepped during training
+    if warmup is not None and epoch < warmup_epochs:
+        warmup.step()
+    else:
+        cosine.step()
 
     writer.close()
     logger.info(
