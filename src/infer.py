@@ -99,6 +99,11 @@ def main():
     ensure_dir(args.output_dir)
     logger = get_logger("infer")
 
+    print("CWD:", os.getcwd())
+    print("Input dir:", os.path.abspath(args.input_dir))
+    print("Output dir:", os.path.abspath(args.output_dir))
+    print("Checkpoint:", os.path.abspath(args.checkpoint))
+
     # Build model and load weights
     model = build_model(cfg).to(torch_device)
     ckpt = torch.load(args.checkpoint, map_location="cpu")
@@ -111,12 +116,14 @@ def main():
     tfm = _build_val_transforms(cfg)
 
     # Collect images
-    exts = (".png", ".jpg", ".tif", ".tiff", ".bmp")
+    exts = (".png", ".jpeg", ".jpg", ".tif", ".tiff", ".bmp")
     paths = [p for p in glob(os.path.join(args.input_dir, "*"))
              if os.path.splitext(p)[1].lower() in exts]
     if len(paths) == 0:
         logger.warning(f"No images found under: {args.input_dir}")
         return
+
+    print("Found images:", len(paths))
 
     logger.info(
         f"Device: {device} | Images: {len(paths)} | Saving to: {args.output_dir}")
@@ -155,5 +162,5 @@ def main():
     logger.info("Inference complete.")
 
 
-if __name__ == '__main--':
+if __name__ == '__main__':
     main()
