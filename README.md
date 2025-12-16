@@ -40,7 +40,8 @@ The project was intentionally developed **locally first**, using a very small da
 
 # 3. Repository Structure
 
-kaggle-sci-image-forgery-seg/
+.
+|kaggle-sci-image-forgery-seg/
 │
 ├── configs/
 │ └── baseline.yaml # Central configuration file (paths, model, training)
