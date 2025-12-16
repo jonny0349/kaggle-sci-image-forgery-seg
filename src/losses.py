@@ -33,7 +33,7 @@ def dice_loss_from_probs(probs: torch.Tensor, targets: torch.Tensor, eps: float 
     intersection = (probs * targets).sum(dim=1)
     union = probs.sum(dim=1) + targets.sum(dim=1)
 
-    dice = (2.0 * intersection + eps) / (union * eps)
+    dice = (2.0 * intersection + eps) / (union + eps)
     return 1.0 - dice.mean()
 
 
