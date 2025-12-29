@@ -1,255 +1,313 @@
-"""
-data.py
-
-Purpose
--------
-- Dataset classes that read images and binary masks from disk.
-- Albumentations augmentation pipelines for train/val.
-- PyTorch DataLoaders with sane defaults.
-
-Assumptions
------------
-- Directory layout is controlled via configs/baseline.yaml:
-    data.root/train/images/*.png
-    data.root/train/masks/*.png
-    data.root/val/images/*.png
-    data.root/val/masks/*.png
-  with same filename stems between image and mask (e.g., 0001.png).
-
-- Masks: single-channel; any non-zero is treated as 1 (forged region).
-"""
-
 from __future__ import annotations
 
 import os
-from typing import Callable, Optional, List
+from dataclasses import dataclass
+from glob import glob
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset
+
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-from torch.utils.data import Dataset, DataLoader
 
 
-def _build_train_transforms(cfg) -> A.BasicTransform:
+# -----------------------
+# Helpers
+# -----------------------
+
+def _is_abs(p: str) -> bool:
+    return os.path.isabs(p)
+
+
+def resolve_path(root: str, p: str) -> str:
     """
-    Version-safe train transforms:
-      - Resize
-      - Horizontal/Vertical flip
-      - Rotate (not Affine / ShiftScaleRotate to avoid API drift)
-      - RandomBrightnessContrast
-      - Normalize + ToTensorV2
+    Join root + p unless p is already absolute.
+    Prevents bugs like /kaggle/working/data/raw + /kaggle/working/data/raw/train/images.
     """
-    # read either dot-access or dict-style
-    resize = getattr(cfg.augment.train, "resize", [768, 768])
-    h, w = resize
-    rotate_limit = cfg.augment.train.get("rotate_limit", 10)
-    rotate_p = cfg.augment.train.get("rotate_p", 0.25)
-
-    return A.Compose([
-        A.Resize(h, w, interpolation=cv2.INTER_LINEAR),
-
-        A.HorizontalFlip(p=cfg.augment.train.get("hflip_p", 0.5)),
-        A.VerticalFlip(p=cfg.augment.train.get("vflip_p", 0.0)),
-
-        # Rotate is widely supported and supports border_mode
-        A.Rotate(limit=rotate_limit,
-                 border_mode=cv2.BORDER_REFLECT_101,
-                 p=rotate_p),
-
-        A.RandomBrightnessContrast(
-            p=cfg.augment.train.get("brightness_contrast_p", 0.15)),
-
-        A.Normalize(mean=(0.485, 0.456, 0.406),
-                    std=(0.229, 0.224, 0.225)),
-        ToTensorV2()
-    ])
+    if p is None:
+        return root
+    return p if _is_abs(p) else os.path.join(root, p)
 
 
-def _build_val_transforms(cfg) -> A.BasicTransform:
+def ensure_dir(path: str) -> str:
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def read_image_rgb(path: str) -> np.ndarray:
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is None:
+        raise FileNotFoundError(f"Could not read image: {path}")
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
+def mask_to_hw(mask: np.ndarray) -> np.ndarray:
     """
-    Version-safe val transforms:
-      - Resize
-      - Normalize + ToTensorV2
-    """
-    resize = getattr(cfg.augment.val, "resize", [768, 768])
-    h, w = resize
-    return A.Compose([
-        A.Resize(h, w, interpolation=cv2.INTER_LINEAR),
-        A.Normalize(mean=(0.485, 0.456, 0.406),
-                    std=(0.229, 0.224, 0.225)),
-        ToTensorV2()
-    ])
+    Normalize masks to HxW, handling:
+    - HxW
+    - 1xHxW
+    - HxWx1
+    - 3xHxW / 4xHxW
+    - HxWx3 / HxWx4
 
+    Returns:
+      HxW array (same dtype as input)
+    """
+    m = np.asarray(mask)
+
+    if m.ndim == 2:
+        return m
+
+    if m.ndim == 3:
+        # [1,H,W]
+        if m.shape[0] == 1:
+            return m[0]
+        # [H,W,1]
+        if m.shape[-1] == 1:
+            return m[..., 0]
+        # [C,H,W] where C in {3,4}
+        if m.shape[0] in (3, 4) and m.shape[1] > 8 and m.shape[2] > 8:
+            return m.max(axis=0)
+        # [H,W,C] where C in {3,4}
+        if m.shape[-1] in (3, 4) and m.shape[0] > 8 and m.shape[1] > 8:
+            return m.max(axis=-1)
+
+    m = np.squeeze(m)
+    if m.ndim != 2:
+        raise ValueError(f"Mask not 2D after normalization. Shape={m.shape}")
+    return m
+
+
+def mask_to_binary01(mask_hw: np.ndarray) -> np.ndarray:
+    """
+    Convert mask HxW to binary {0,1} uint8.
+    """
+    m = mask_hw
+    # Some datasets store floats, ints, or encoded channels — we treat >0 as foreground.
+    m01 = (m > 0).astype(np.uint8)
+    return m01
+
+
+def build_stem_to_image_map(images_dir: str, recursive: bool = True) -> Dict[str, str]:
+    """
+    Build {stem: absolute_image_path} supporting nested folders (Kaggle uses authentic/forged).
+    """
+    exts = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
+    pattern = os.path.join(
+        images_dir, "**", "*") if recursive else os.path.join(images_dir, "*")
+    paths = [p for p in glob(pattern, recursive=recursive)
+             if os.path.splitext(p)[1].lower() in exts]
+
+    m: Dict[str, str] = {}
+    for p in paths:
+        stem = os.path.splitext(os.path.basename(p))[0]
+        # If duplicates exist, keep the first (rare). You can change policy later.
+        if stem not in m:
+            m[stem] = p
+    return m
+
+
+def build_stem_to_mask_map(masks_dir: str) -> Dict[str, str]:
+    """
+    Build {stem: absolute_mask_path} for .npy masks.
+    """
+    paths = glob(os.path.join(masks_dir, "*.npy"))
+    m: Dict[str, str] = {}
+    for p in paths:
+        stem = os.path.splitext(os.path.basename(p))[0]
+        if stem not in m:
+            m[stem] = p
+    return m
+
+
+# -----------------------
+# Transforms
+# -----------------------
+
+def _build_train_transforms(cfg):
+    h = int(cfg.data.resize_h)
+    w = int(cfg.data.resize_w)
+
+    # Keep this conservative to avoid albumentations version mismatches.
+    return A.Compose(
+        [
+            A.Resize(h, w),
+            A.HorizontalFlip(p=float(getattr(cfg.augment, "hflip_p", 0.5))),
+            A.RandomBrightnessContrast(
+                p=float(getattr(cfg.augment, "bc_p", 0.2))),
+            A.Normalize(),
+            ToTensorV2(),
+        ],
+        is_check_shapes=True,
+    )
+
+
+def _build_val_transforms(cfg):
+    h = int(cfg.data.resize_h)
+    w = int(cfg.data.resize_w)
+    return A.Compose(
+        [
+            A.Resize(h, w),
+            A.Normalize(),
+            ToTensorV2(),
+        ],
+        is_check_shapes=True,
+    )
+
+
+# -----------------------
+# Dataset
+# -----------------------
 
 class ImageMaskDataset(Dataset):
     """
-    Generic image+mask dataset.
-
-    Parameters
-    ----------
-    images_dir : str
-        Folder containing image files.
-    masks_dir : str
-        Folder containing mask files.
-    img_ext : str
-        Image extension (e.g., ".png", ".jpg").
-    mask_ext : str
-        Mask extension (e.g., ".png", ".npy").
-    mask_suffix : str
-        Optional suffix between stem and extension for mask files (e.g., "_mask").
-    transform : albumentations transform
-        Applied jointly to image and mask.
-    background_is_zero : bool
-        If True, non-zero mask pixels become 1 (binary).
+    Image + mask dataset with robust stem matching and mask normalization.
+    Supports:
+      - flat folders: images/*.png and masks/*.npy
+      - nested images (Kaggle): train_images/authentic|forged/*.png
     """
 
     def __init__(
         self,
         images_dir: str,
         masks_dir: str,
-        img_ext: str = ".png",
-        mask_ext: str = ".png",
-        mask_suffix: str = "",
-        transform: Optional[Callable] = None,
-        background_is_zero: bool = True
-    ) -> None:
-        super().__init__()
+        ids: Optional[List[str]] = None,
+        transform=None,
+        recursive_images: bool = True,
+    ):
         self.images_dir = images_dir
         self.masks_dir = masks_dir
-        self.img_ext = img_ext.lower()
-        self.mask_ext = mask_ext.lower()
-        self.mask_suffix = mask_suffix
         self.transform = transform
-        self.background_is_zero = background_is_zero
+        self.recursive_images = recursive_images
 
-        self.ids = self._collect_ids()
+        if not os.path.isdir(images_dir):
+            raise RuntimeError(f"Images directory not found: {images_dir}")
+        if not os.path.isdir(masks_dir):
+            raise RuntimeError(f"Masks directory not found: {masks_dir}")
 
-    def _mask_path(self, stem: str) -> str:
-        return os.path.join(self.masks_dir, f"{stem}{self.mask_suffix}{self.mask_ext}")
+        self.stem_to_img = build_stem_to_image_map(
+            images_dir, recursive=recursive_images)
+        self.stem_to_msk = build_stem_to_mask_map(masks_dir)
 
-    def _collect_ids(self) -> List[str]:
-        if not os.path.isdir(self.images_dir):
+        if ids is None:
+            common = sorted(set(self.stem_to_img.keys()) &
+                            set(self.stem_to_msk.keys()))
+            self.ids = common
+        else:
+            self.ids = [s for s in ids if (
+                s in self.stem_to_img and s in self.stem_to_msk)]
+
+        if len(self.ids) == 0:
             raise RuntimeError(
-                f"Images directory not found: {self.images_dir}")
-        if not os.path.isdir(self.masks_dir):
-            raise RuntimeError(f"Masks directory not found: {self.masks_dir}")
-
-        ids: List[str] = []
-        for f in os.listdir(self.images_dir):
-            if f.lower().endswith(self.img_ext):
-                stem = os.path.splitext(f)[0]
-                if os.path.exists(self._mask_path(stem)):
-                    ids.append(stem)
-        ids.sort()
-        if len(ids) == 0:
-            raise RuntimeError(
-                f"No (image, mask) pairs found under {self.images_dir} and {self.masks_dir}."
+                f"No (image, mask) pairs found under {images_dir} and {masks_dir}.\n"
+                f"Tip: if images are nested (authentic/forged), recursive scan must be enabled."
             )
-        return ids
 
     def __len__(self) -> int:
         return len(self.ids)
 
     def __getitem__(self, idx: int):
         stem = self.ids[idx]
-        img_path = os.path.join(self.images_dir, stem + self.img_ext)
-        msk_path = self._mask_path(stem)
+        img_path = self.stem_to_img[stem]
+        msk_path = self.stem_to_msk[stem]
 
-        # Read image (BGR -> RGB)
-        img = cv2.imread(img_path, cv2.IMREAD_COLOR)
-        if img is None:
-            raise FileNotFoundError(f"Could not read image: {img_path}")
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = read_image_rgb(img_path)  # HxWx3 RGB
+        mask = np.load(msk_path)
 
-        # Read mask
-        if self.mask_ext == ".npy":
-            mask = np.load(msk_path)
-            # Accept common shapes/dtypes and sanitize
-            if mask.ndim == 3:
-                # If HxWxC, take first channel
-                mask = mask[..., 0]
-            mask = mask.astype(np.float32)
-        else:
-            mask = cv2.imread(msk_path, cv2.IMREAD_GRAYSCALE)
-            if mask is None:
-                raise FileNotFoundError(f"Could not read mask: {msk_path}")
-            mask = mask.astype(np.float32)
+        mask = mask_to_hw(mask)
+        mask01 = mask_to_binary01(mask)  # HxW {0,1}
 
-        # Binarize:
-        # If background_is_zero=True, then any non-zero -> 1
-        # Else invert (treat zeros as foreground)
-        if self.background_is_zero:
-            mask = (mask > 0.5).astype(np.uint8)
-        else:
-            mask = (mask <= 0.5).astype(np.uint8)
-
-        # After reading `img` (RGB) and `mask` (float/uint8) and binarizing...
-
-        # --- Ensure mask shape matches image shape BEFORE Albumentations ---
+        # If mask doesn't match image, fix here (before transforms)
         ih, iw = img.shape[:2]
-        mh, mw = mask.shape[:2]
-        if (mh != ih) or (mw != iw):
-            # Resize mask to image size using NEAREST to preserve labels
-            mask = cv2.resize(mask, (iw, ih), interpolation=cv2.INTER_NEAREST)
+        if mask01.shape != (ih, iw):
+            mask01 = cv2.resize(
+                mask01, (iw, ih), interpolation=cv2.INTER_NEAREST)
 
-        # Albumentations expects dicts:
         if self.transform is not None:
-            transformed = self.transform(image=img, mask=mask)
-            img = transformed["image"]
-            mask = transformed["mask"].unsqueeze(0).float()  # [1, H, W]
+            out = self.transform(image=img, mask=mask01)
+            img_t = out["image"]  # [3,H,W]
+            mask_t = out["mask"]  # [H,W]
         else:
-            img = np.transpose(img, (2, 0, 1))
-            mask = np.expand_dims(mask, 0).astype(np.float32)
+            img_t = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+            mask_t = torch.from_numpy(mask01).long()
 
-        return img, mask, stem
+        # Ensure mask is [1,H,W] float32 for BCEWithLogits
+        mask_t = mask_t.unsqueeze(0).float()
+
+        return img_t, mask_t, stem
 
 
-def make_dataloaders(cfg, pin_memory: boo = True):
+# -----------------------
+# Dataloaders + layout detection
+# -----------------------
+
+def _detect_layout(root: str) -> str:
     """
-    Construct train/val DataLoaders based on the config.
-
-    Returns
-    -------
-    dict with keys: train, val
+    Auto-detect dataset layout.
+    Returns 'raw' or 'kaggle'.
     """
+    if os.path.isdir(os.path.join(root, "train_images")) and os.path.isdir(os.path.join(root, "train_masks")):
+        return "kaggle"
+    if os.path.isdir(os.path.join(root, "raw", "train", "images")):
+        return "raw"
+    return "raw"
+
+
+def make_dataloaders(cfg, pin_memory: bool = False):
+    """
+    Creates train/val DataLoaders.
+    Works on both:
+      - cfg.data.root pointing to Kaggle input root (train_images/train_masks)
+      - cfg.data.root pointing to a local project data directory containing raw/train/images ...
+    """
+    root = str(cfg.data.root)
+    layout = getattr(cfg.data, "layout", "auto")
+    if layout == "auto":
+        layout = _detect_layout(root)
+
+    if layout == "kaggle":
+        train_images = resolve_path(root, "train_images")
+        train_masks = resolve_path(root, "train_masks")
+        # You will create a true val split next; for now we allow val to be provided by cfg if exists.
+        val_images = resolve_path(root, getattr(
+            cfg.data, "val_images", "train_images"))
+        val_masks = resolve_path(root, getattr(
+            cfg.data, "val_masks", "train_masks"))
+        recursive = True
+    else:
+        train_images = resolve_path(root, "raw/train/images")
+        train_masks = resolve_path(root, "raw/train/masks")
+        val_images = resolve_path(root, "raw/val/images")
+        val_masks = resolve_path(root, "raw/val/masks")
+        recursive = False
+
     train_tfms = _build_train_transforms(cfg)
     val_tfms = _build_val_transforms(cfg)
 
     train_ds = ImageMaskDataset(
-        images_dir=os.path.join(cfg.data.root, cfg.data.train_images_dir),
-        masks_dir=os.path.join(cfg.data.root, cfg.data.train_masks_dir),
-        img_ext=cfg.data.img_ext,
-        mask_ext=cfg.data.mask_ext,
-        mask_suffix=cfg.data.get("mask_suffix", ""),
-        transform=train_tfms,
-        background_is_zero=cfg.data.background_is_zero
-    )
+        train_images, train_masks, transform=train_tfms, recursive_images=recursive)
+    val_ds = ImageMaskDataset(val_images, val_masks,
+                              transform=val_tfms, recursive_images=recursive)
 
-    val_ds = ImageMaskDataset(
-        images_dir=os.path.join(cfg.data.root, cfg.data.val_images_dir),
-        masks_dir=os.path.join(cfg.data.root, cfg.data.val_masks_dir),
-        img_ext=cfg.data.img_ext,
-        mask_ext=cfg.data.mask_ext,
-        mask_suffix=cfg.data.get("mask_suffix", ""),
-        transform=val_tfms,
-        background_is_zero=cfg.data.background_is_zero
-    )
+    bs = int(cfg.train.batch_size)
+    nw = int(cfg.train.num_workers)
 
     train_loader = DataLoader(
         train_ds,
-        batch_size=cfg.train.batch_size,
+        batch_size=bs,
         shuffle=True,
-        num_workers=cfg.train.num_workers,
+        num_workers=nw,
         pin_memory=pin_memory,
         drop_last=False,
     )
-
     val_loader = DataLoader(
         val_ds,
-        batch_size=max(1, cfg.train.batch_size // 2),
+        batch_size=bs,
         shuffle=False,
-        num_workers=cfg.train.num_workers,
+        num_workers=nw,
         pin_memory=pin_memory,
         drop_last=False,
     )

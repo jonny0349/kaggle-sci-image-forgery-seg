@@ -6,7 +6,10 @@ project:
   output_dir: "outputs" #Logs, checkpoints, predictions
 
 data:
-  root: "data/raw"
+  root: "data"
+  layout: raw
+  resize_h: 512
+  resize_w: 512
   train_images_dir: "train/images"
   train_masks_dir: "train/masks"
   val_images_dir: "val/images"

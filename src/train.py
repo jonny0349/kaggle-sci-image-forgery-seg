@@ -33,6 +33,11 @@ from src.model import build_model
 from src.losses import make_loss
 from src.metrics import dice_coef, iou_coef
 
+try:
+    from torch.utils.tensorboard import SummaryWriter   # Type: ignore
+except Exception:
+    SummaryWriter = None
+
 
 def create_scheduler(optimizer, cfg):
     """
@@ -119,7 +124,18 @@ def main():
     # Prepare outputs and logging
     out_dir = ensure_dir(cfg.project.output_dir)
     paths = build_output_tree(out_dir)
-    writer = SummaryWriter(log_dir=paths["logs"])
+    writer = None
+    if SummaryWriter is not None and getattr(cfg, "logging", None) and getattr(cfg.logging, "tensorboard", True):
+        writer = SummaryWriter(log_dir=paths["logs"])
+
+    if writer is not None:
+        writer.add_scalar("train/loss", train_loss, epoch)
+        writer.add_scalar("val/dice", val_dice, epoch)
+        writer.add_scalar("val/iou", val_iou, epoch)
+
+    if writer is not None:
+        writer.close()
+
     logger = get_logger("train", os.path.join(paths["logs"], "train.log"))
 
     # Save a snapshot of config for traceability
