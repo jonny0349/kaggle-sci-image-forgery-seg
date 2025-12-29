@@ -1,0 +1,68 @@
+# Purpose single source of truth for paths, model/loss/opt, and train params
+
+project:
+  seed: 2025
+  device: "auto" #will pick cuda>mps>cpu automatically
+  output_dir: "/kaggle/working/kaggle-sci-image-forgery-seg/outputs" #Logs, checkpoints, predictions
+
+data:
+  root: "/kaggle/input/recodai-luc-scientific-image-forgery-detection"
+  layout: kaggle
+  resize_h: 512
+  resize_w: 512
+  train_images_dir: "train/images"
+  train_masks_dir: "train/masks"
+  val_images_dir: "val/images"
+  val_masks_dir: "val/masks"
+  img_ext: ".png"
+  mask_ext: ".npy"
+  mask_suffix: "" # e.g.,"_mask" if files are like 10_mask.npy
+  num_classes: 1 # Binary segmentation: forged vs background
+  background_is_zero: True
+
+augment:
+  train:
+    resize: [768, 768] # H, W
+    hflip_p: 0.5
+    vflip_p: 0.0
+    rotate_limit: 10
+    rotate_p: 0.25
+    brightness_contrast_p: 0.15
+  val:
+    resize: [768, 768]
+
+model:
+  arch: "UNet" # From segementation_models_pytorch
+  encoder: "resnet34"
+  encoder_weights: "imagenet"
+  in_channels: 3
+  classes: 1
+
+loss:
+  name: "bce_dice" # BCE + Dice combo (stable baseline)
+
+optimizer:
+  name: "adamw"
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+
+scheduler:
+  name: "cosine_anneal_warmup"
+  warmup_epochs: 1
+  max_epochs: 20
+  min_lr: 1.0e-6
+
+train:
+  epochs: 3
+  batch_size: 4
+  num_workers: 2
+  grad_accum_steps: 1
+  mixed_precision: true
+
+val:
+  interval_epochs: 1
+
+checkpoint:
+  save_top_k: 3
+  metric: "dice"
+  mode: "max"
